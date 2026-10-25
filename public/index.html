@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NestJS Realtime Patterns</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7280; --border: #e3e6eb;
+      --ws: #7c3aed; --sse: #0891b2; --lp: #d97706; --ok: #16a34a; --off: #9ca3af;
+      --req: #2563eb; --res: #16a34a; --me: #db2777;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #111318; --panel: #1a1d24; --text: #e6e8ec; --muted: #9aa1ad; --border: #2a2f39;
+              --req: #60a5fa; --res: #4ade80; --me: #f472b6; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 20px 16px 8px; max-width: 1280px; margin: 0 auto; }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); }
+    main { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; padding: 16px; max-width: 1280px; margin: 0 auto; }
+    section { background: var(--panel); border: 1px solid var(--border); border-top: 4px solid var(--accent); border-radius: 10px; display: flex; flex-direction: column; min-height: 520px; }
+    section[data-pattern="ws"] { --accent: var(--ws); }
+    section[data-pattern="sse"] { --accent: var(--sse); }
+    section[data-pattern="lp"] { --accent: var(--lp); }
+    .head { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+    .head h2 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+    .head small { color: var(--muted); display: block; margin-top: 2px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); }
+    .dot.on { background: var(--ok); }
+    .status { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--muted); }
+    .log { flex: 1; overflow-y: auto; padding: 10px 14px; font: 12px/1.5 ui-monospace, Menlo, monospace; max-height: 400px; }
+    .log div { padding: 2px 0; border-bottom: 1px dashed var(--border); word-break: break-word; }
+    .log .sys { color: var(--muted); }
+    .log .req { color: var(--req); }
+    .log .res { color: var(--res); }
+    .log .me b { color: var(--me); }
+    .log .msg b { color: var(--accent); }
+    .tag { font-size: 10px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
+    form { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
+    input { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+    button { padding: 7px 12px; border: 0; border-radius: 6px; background: var(--accent, #374151); color: #fff; font: inherit; cursor: pointer; }
+    button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .controls { display: flex; gap: 8px; padding: 10px 14px 0; }
+    .legend { padding: 0 14px 10px; font-size: 11px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NestJS Realtime Patterns</h1>
+    <p>Three independent demos. The server simulates incoming data for each one separately.</p>
+  </header>
+
+  <main>
+    <section data-pattern="ws">
+      <div class="head">
+        <h2><span class="dot" id="ws-dot"></span>WebSocket <span class="status" id="ws-status">disconnected</span></h2>
+        <small>Socket.IO · namespace /chat · full-duplex</small>
+      </div>
+      <div class="controls"><button class="secondary" id="ws-toggle">Connect</button></div>
+      <div class="log" id="ws-log"></div>
+      <form id="ws-form"><input placeholder="Connect, then send a message…" autocomplete="off" /><button>Send</button></form>
+    </section>
+
+    <section data-pattern="sse">
+      <div class="head">
+        <h2><span class="dot" id="sse-dot"></span>Server-Sent Events <span class="status" id="sse-status">disconnected</span></h2>
+        <small>GET /sse/stream · one request, many events · server → client</small>
+      </div>
+      <div class="controls"><button class="secondary" id="sse-toggle">Open stream</button></div>
+      <div class="log" id="sse-log"></div>
+      <div class="legend">→ request &nbsp; ← response &nbsp; events arrive on the same open response</div>
+    </section>
+
+    <section data-pattern="lp">
+      <div class="head">
+        <h2><span class="dot" id="lp-dot"></span>Long Polling <span class="status" id="lp-status">stopped</span></h2>
+        <small>GET /long-polling?since=&lt;cursor&gt; · one message per request</small>
+      </div>
+      <div class="controls"><button class="secondary" id="lp-toggle">Start polling</button></div>
+      <div class="log" id="lp-log"></div>
+      <div class="legend">→ request &nbsp; ← response &nbsp; the server holds each request up to 10s</div>
+    </section>
+  </main>
+
+  <!-- Served by the Socket.IO server itself, so no CDN is needed. -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const time = () => new Date().toLocaleTimeString();
+
+    function log(prefix, text, cls = 'sys') {
+      const el = $(prefix + '-log');
+      const row = document.createElement('div');
+      row.className = cls;
+      row.textContent = `[${time()}] ${text}`;
+      el.appendChild(row);
+      el.scrollTop = el.scrollHeight;
+    }
+    function logMessage(prefix, m, cls = 'msg') {
+      const el = $(prefix + '-log');
+      const row = document.createElement('div');
+      row.className = cls;
+      const b = document.createElement('b');
+      b.textContent = m.from;
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = `#${m.id}`;
+      row.append(`[${time()}] `, b, `: ${m.text} `, tag);
+      el.appendChild(row);
+      el.scrollTop = el.scrollHeight;
+    }
+    function setStatus(prefix, on, text) {
+      $(prefix + '-dot').classList.toggle('on', on);
+      $(prefix + '-status').textContent = text;
+    }
+
+    // ---------------- 1. WebSocket (Socket.IO) ----------------
+    let socket = null;
+    $('ws-toggle').onclick = () => {
+      if (socket) { socket.disconnect(); socket = null; $('ws-toggle').textContent = 'Connect'; return; }
+      socket = io('/chat');
+      $('ws-toggle').textContent = 'Disconnect';
+      socket.on('connect', () => {
+        setStatus('ws', true, 'connected · ' + socket.io.engine.transport.name);
+        // Socket.IO starts on HTTP long polling and upgrades to a real WebSocket when it can.
+        socket.io.engine.once('upgrade', (t) => setStatus('ws', true, 'connected · ' + t.name));
+      });
+      socket.on('welcome', ({ id }) => log('ws', `connected as ${id}, server will start sending messages`));
+      socket.on('disconnect', (reason) => { setStatus('ws', false, 'disconnected'); log('ws', 'disconnected: ' + reason); });
+      socket.on('message', (m) => logMessage('ws', m));
+      socket.on('exception', (err) => log('ws', 'server error: ' + err.message));
+    };
+    $('ws-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = e.target.querySelector('input');
+      const text = input.value.trim();
+      if (!text) return;
+      if (!socket?.connected) return log('ws', 'connect first');
+      input.value = '';
+      logMessage('ws', { from: 'you', text, id: '→' }, 'me');
+      try {
+        // emitWithAck resolves with whatever the @SubscribeMessage handler returns.
+        const ack = await socket.timeout(5000).emitWithAck('message', { text });
+        log('ws', `ack: server received "${ack.received}"`);
+      } catch (err) {
+        log('ws', 'no ack: ' + err.message);
+      }
+    });
+
+    // ---------------- 2. Server-Sent Events ----------------
+    let source = null;
+    $('sse-toggle').onclick = () => {
+      if (source) {
+        source.close(); source = null;
+        setStatus('sse', false, 'disconnected');
+        log('sse', 'client closed the connection');
+        $('sse-toggle').textContent = 'Open stream';
+        return;
+      }
+      log('sse', '→ GET /sse/stream   Accept: text/event-stream', 'req');
+      source = new EventSource('/sse/stream');
+      $('sse-toggle').textContent = 'Close stream';
+      source.onopen = () => {
+        setStatus('sse', true, 'streaming');
+        log('sse', '← 200 OK   Content-Type: text/event-stream (response stays open)', 'res');
+      };
+      // EventSource reconnects by itself and sends Last-Event-ID so ids continue.
+      source.onerror = () => {
+        setStatus('sse', false, 'reconnecting…');
+        log('sse', 'connection lost, browser will retry with Last-Event-ID: ' + (source.lastEventId || 'none'));
+      };
+      source.addEventListener('message', (e) => logMessage('sse', JSON.parse(e.data)));
+    };
+
+    // ---------------- 3. Long Polling ----------------
+    let polling = false;
+    let cursor = 0;
+    let controller = null;
+    async function pollLoop() {
+      while (polling) {
+        controller = new AbortController();
+        const url = `/long-polling?since=${cursor}`;
+        const started = performance.now();
+        setStatus('lp', true, 'request pending…');
+        log('lp', `→ GET ${url}`, 'req');
+        try {
+          const res = await fetch(url, { signal: controller.signal });
+          const body = await res.json();
+          const secs = ((performance.now() - started) / 1000).toFixed(1);
+          cursor = body.cursor;
+          if (body.timedOut) {
+            log('lp', `← ${res.status} after ${secs}s   no new data (timed out)`, 'res');
+          } else {
+            log('lp', `← ${res.status} after ${secs}s   1 message`, 'res');
+            logMessage('lp', body.message);
+          }
+        } catch (err) {
+          if (err.name === 'AbortError') break;
+          setStatus('lp', false, 'error, retrying in 2s');
+          log('lp', 'poll failed: ' + err.message);
+          await new Promise((r) => setTimeout(r, 2000)); // back off instead of hammering the server
+        }
+      }
+    }
+    $('lp-toggle').onclick = () => {
+      polling = !polling;
+      $('lp-toggle').textContent = polling ? 'Stop polling' : 'Start polling';
+      if (polling) { pollLoop(); }
+      else { controller?.abort(); setStatus('lp', false, 'stopped'); log('lp', 'client aborted the pending request'); }
+    };
+  </script>
+</body>
+</html>
