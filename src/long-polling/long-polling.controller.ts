@@ -1,5 +1,6 @@
 import { Controller, Get, Logger, Query, Res } from '@nestjs/common';
 import type { Response } from 'express';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { randomBetween, randomMessage } from '../simulation/simulated-message';
 import type { SimulatedMessage } from '../simulation/simulated-message';
 
@@ -31,44 +32,54 @@ export class LongPollingController {
   private readonly logger = new Logger(LongPollingController.name);
 
   @Get()
-  poll(
+  async poll(
     @Res({ passthrough: true }) res: Response,
     @Query('since') sinceParam?: string,
     @Query('timeout') timeoutParam?: string,
   ): Promise<PollResponse> {
     const since = this.parseCursor(sinceParam);
     const timeoutMs = this.parseTimeout(timeoutParam);
-    const dataDelayMs = randomBetween(MIN_DATA_DELAY_MS, MAX_DATA_DELAY_MS);
     const startedAt = Date.now();
     this.logger.log(`Poll parked (since=${since}, timeout=${timeoutMs}ms)`);
 
-    // Park the request until the simulated message is ready, the timeout fires,
-    // or the client goes away, whichever happens first.
-    return new Promise<PollResponse>((resolve) => {
-      const finish = (message: SimulatedMessage | null) => {
-        clearTimeout(dataTimer);
-        clearTimeout(timeoutTimer);
-        res.off('close', onClose);
-        resolve({
-          cursor: message ? message.id : since,
-          message,
-          timedOut: message === null,
-          waitedMs: Date.now() - startedAt,
-        });
-      };
+    // Cancels whichever wait is still pending once we have an answer,
+    // or both of them if the client goes away first.
+    const abort = new AbortController();
+    const onClose = () => {
+      if (!res.writableEnded) {
+        this.logger.log('Poll aborted by client');
+        abort.abort();
+      }
+    };
+    res.on('close', onClose);
 
-      const dataTimer = setTimeout(() => finish(randomMessage(since + 1)), dataDelayMs);
-      const timeoutTimer = setTimeout(() => finish(null), timeoutMs);
+    let message: SimulatedMessage | null = null;
+    try {
+      // Park the request until the simulated message is ready or the timeout fires.
+      message = await Promise.race([
+        this.waitForMessage(since + 1, abort.signal),
+        sleep(timeoutMs, null, { signal: abort.signal }),
+      ]);
+    } catch (err) {
+      // An aborted wait means the client disconnected; anything else is a real error.
+      if (!abort.signal.aborted) throw err;
+    } finally {
+      abort.abort(); // clear the losing timer so parked requests don't leak
+      res.off('close', onClose);
+    }
 
-      // Client aborted. Free the timers so parked requests don't leak.
-      const onClose = () => {
-        if (!res.writableEnded) {
-          this.logger.log('Poll aborted by client');
-          finish(null);
-        }
-      };
-      res.on('close', onClose);
-    });
+    return {
+      cursor: message ? message.id : since,
+      message,
+      timedOut: message === null,
+      waitedMs: Date.now() - startedAt,
+    };
+  }
+
+  /** Simulates "new data arrives on the server" after a random delay. */
+  private async waitForMessage(id: number, signal: AbortSignal): Promise<SimulatedMessage> {
+    await sleep(randomBetween(MIN_DATA_DELAY_MS, MAX_DATA_DELAY_MS), undefined, { signal });
+    return randomMessage(id);
   }
 
   private parseCursor(value?: string): number {

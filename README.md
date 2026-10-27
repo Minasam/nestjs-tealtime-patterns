@@ -298,8 +298,8 @@ Always send the returned `cursor` back as `since` on the next request.
 
 ### Key implementation points
 
-- The handler returns a `Promise` that resolves on **whichever comes first**: the simulated data timer, the timeout timer, or the client disconnecting (`res.on('close')`).
-- `finish()` clears both timers and removes the listener on every exit path. Without it, every abandoned poll would leak timers.
+- The handler is `async` and `await`s **whichever comes first** (`Promise.race`): the simulated data wait or the timeout wait. Both use `setTimeout` from `node:timers/promises`.
+- Both waits share one `AbortController`. If the client disconnects (`res.on('close')`), `abort()` cancels both. The `finally` block also aborts, which clears the losing timer, and removes the listener on every exit path. Without it, every abandoned poll would leak timers.
 - The timeout should stay below proxy/load-balancer idle limits (often 30–60 s), or the infrastructure kills requests with a `504` before the app responds.
 - `@Res({ passthrough: true })` gives access to the Express response for the `close` event, while Nest still serialises the return value.
 
@@ -346,7 +346,8 @@ done
 ```js
 let cursor = 0;
 while (true) {
-  const body = await fetch(`/long-polling?since=${cursor}`).then((r) => r.json());
+  const res = await fetch(`/long-polling?since=${cursor}`);
+  const body = await res.json();
   cursor = body.cursor;
   if (body.message) console.log(body.message);
 }
